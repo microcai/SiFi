@@ -52,6 +52,26 @@ static void packet_decoder(boost::coroutines::asymmetric_coroutine<uint8_t>::pul
 	}
 }
 
+
+static dqueue<5, std::array<uint8_t, 11>> packet_send_buffer;
+
+// 数据打包编码
+static void datapacker(boost::coroutines::asymmetric_coroutine<uint8_t>::push_type & sink)
+{
+	// 数据打包，就将数据按照一定的字节封装起来
+	// 每个封装后的大小为 62 字节，占用传输时间 0.5s
+
+	if(packet_send_buffer.empty())
+		return;
+
+	// 拿到一个包
+	auto packet = packet_send_buffer.pull();
+
+	// 按照一定的次序送出
+	for(auto b : packet)
+		sink(b);
+}
+
 static void bytes_laches(boost::coroutines::asymmetric_coroutine<uint8_t>::pull_type & halfbytesource,
 	boost::coroutines::asymmetric_coroutine<uint8_t>::push_type & bytestreamsink)
 {
@@ -250,102 +270,8 @@ static void BaseBand_Filter(boost::coroutines::asymmetric_coroutine<std::tuple<d
 	}
 }
 
-#include "Goertzel.hpp"
-
-template<unsigned windowssize, unsigned incremental>
-static void FSK_demodulator(boost::coroutines::asymmetric_coroutine<float>::pull_type & source)
-{
-	std::array<float, windowssize> Samples;
-
-	const std::array<float, windowssize> Hammingwindow = [](){
-		std::array<float, windowssize> r;
-		for(int i=0; i < r.size(); i++)
-		{
-			r[i] = 0.5 * (
-				1 - std::cos( circumference<double>(i) / (r.size() -1) )
-			);
-		}
-		return r;
-	}();
-
-	boost::coroutines::asymmetric_coroutine<std::tuple<double,double>>::push_type baseband_filter(BaseBand_Filter);
-
-	while(source)
-	{
-		std::array<float, windowssize> CheckWindow = { 0 };
-
-		// 移动 incremental 个采样点	
-		std::move(std::begin(Samples)+incremental, std::end(Samples), std::begin(Samples));
-		for(unsigned i = windowssize - incremental; i < windowssize ; i++)
-		{
-			Samples[i] = source.get();
-			source();
-		}
-		// 加 Hammingwindow	
-		std::transform(std::begin(Samples), std::end(Samples),
-			std::begin(Hammingwindow), std::begin(CheckWindow), [](auto a, auto b){return a * b;});
-
-		// 执行检测
-		auto freq1 = Goertzel_frequency_detector<windowssize>(CheckWindow, freq_selector()[0], samplerate);
-		auto freq2 = Goertzel_frequency_detector<windowssize>(CheckWindow, freq_selector()[1], samplerate);
-
-		// NOTE: 向流水线下游传递，从频点信号中恢复基带信号
-		t++;
-		baseband_filter(std::make_tuple(freq1,freq2));
-	}
-}
-
-// 接收器
-static void SiFi_Rx()
-{
-	static const pa_sample_spec ss = {
-		PA_SAMPLE_S16LE,
-		samplerate,
-		1
-	};
-
-	boost::coroutines::asymmetric_coroutine<float>::push_type demodulator(FSK_demodulator<240,80>);
-
-	// 打开音频设备	
-	pa_simple pa(NULL, "SiFi", PA_STREAM_RECORD, NULL, "receive SiFi signals", &ss, NULL, NULL);
-
-	// 循环读取
-	while(true)
-	{
-		std::array<int16_t, 480> buf = { 0 };
-		auto  readed = pa.read(boost::asio::buffer(buf, buf.size()));
-		
-		BOOST_VERIFY(readed == 0);
-
-		// 传递给流水线下一步
-		std::for_each(std::begin(buf),std::end(buf),[&demodulator](int16_t v){
-			demodulator( v / 32768.0 );
-		});
-	}
-	// RAII 自动关闭了
-}
-
-static dqueue<5, std::array<uint8_t, 11>> packet_send_buffer;
-
-// 数据打包编码
-static void datapacker(boost::coroutines::asymmetric_coroutine<uint8_t>::push_type & sink)
-{
-	// 数据打包，就将数据按照一定的字节封装起来
-	// 每个封装后的大小为 62 字节，占用传输时间 0.5s
-	
-	if(packet_send_buffer.empty())
-		return;
-	
-	// 拿到一个包
-	auto packet = packet_send_buffer.pull();
-
-	// 按照一定的次序送出
-	for(auto b : packet)
-		sink(b);
-}
-
-// FFM 调制编码器 ( Four to Five modulation)
-static void FFM_encoder(boost::coroutines::asymmetric_coroutine<int>::push_type & sink)
+// 信道编码 使用  4b5b 编码后执行冯 1 跳变调制
+static void channel_encoder(boost::coroutines::asymmetric_coroutine<int>::push_type & sink)
 {
 	#include "4b5btable.ipp"
 
@@ -400,13 +326,59 @@ static void FFM_encoder(boost::coroutines::asymmetric_coroutine<int>::push_type 
 	}
 }
 
+
+#include "Goertzel.hpp"
+
+template<unsigned windowssize, unsigned incremental>
+static void FSK_demodulator(boost::coroutines::asymmetric_coroutine<float>::pull_type & source)
+{
+	std::array<float, windowssize> Samples;
+
+	const std::array<float, windowssize> Hammingwindow = [](){
+		std::array<float, windowssize> r;
+		for(int i=0; i < r.size(); i++)
+		{
+			r[i] = 0.5 * (
+				1 - std::cos( circumference<double>(i) / (r.size() -1) )
+			);
+		}
+		return r;
+	}();
+
+	boost::coroutines::asymmetric_coroutine<std::tuple<double,double>>::push_type baseband_filter(BaseBand_Filter);
+
+	while(source)
+	{
+		std::array<float, windowssize> CheckWindow = { 0 };
+
+		// 移动 incremental 个采样点
+		std::move(std::begin(Samples)+incremental, std::end(Samples), std::begin(Samples));
+		for(unsigned i = windowssize - incremental; i < windowssize ; i++)
+		{
+			Samples[i] = source.get();
+			source();
+		}
+		// 加 Hammingwindow
+		std::transform(std::begin(Samples), std::end(Samples),
+			std::begin(Hammingwindow), std::begin(CheckWindow), [](auto a, auto b){return a * b;});
+
+		// 执行检测
+		auto freq1 = Goertzel_frequency_detector<windowssize>(CheckWindow, freq_selector()[0], samplerate);
+		auto freq2 = Goertzel_frequency_detector<windowssize>(CheckWindow, freq_selector()[1], samplerate);
+
+		// NOTE: 向流水线下游传递，从频点信号中恢复基带信号
+		t++;
+		baseband_filter(std::make_tuple(freq1,freq2));
+	}
+}
+
 //  FSK 调制器
 static void FSK_modulator(boost::coroutines::asymmetric_coroutine<double>::push_type & sink)
 {
 	const double TWO_PI = 4 * std::asin(1.0);
 	double last_sample = 0.0;
 
-	boost::coroutines::asymmetric_coroutine<int>::pull_type encoder(FFM_encoder);
+	boost::coroutines::asymmetric_coroutine<int>::pull_type encoder(channel_encoder);
 
 	// 循环读取
 	do
@@ -432,6 +404,37 @@ static void FSK_modulator(boost::coroutines::asymmetric_coroutine<double>::push_
 				last_sample = 0;
 		encoder();
 	}while(encoder);
+}
+
+// 接收器
+static void SiFi_Rx()
+{
+	static const pa_sample_spec ss = {
+		PA_SAMPLE_S16LE,
+		samplerate,
+		1
+	};
+
+	boost::coroutines::asymmetric_coroutine<float>::push_type demodulator(FSK_demodulator<240,80>);
+
+	// 打开音频设备
+	pa_simple pa(NULL, "SiFi", PA_STREAM_RECORD, NULL, "receive SiFi signals", &ss, NULL, NULL);
+
+	// 循环读取
+	while(true)
+	{
+		std::array<int16_t, 480> buf = { 0 };
+		auto  readed = pa.read(boost::asio::buffer(buf, buf.size()));
+
+		BOOST_VERIFY(readed == 0);
+
+		// 传递给流水线下一步
+		for( auto sample : buf)
+		{
+			demodulator( sample / 32768.0 );
+		}
+	}
+	// RAII 自动关闭了
 }
 
 // 发射部分代码
