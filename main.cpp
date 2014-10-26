@@ -415,7 +415,7 @@ static void SiFi_Rx()
 		1
 	};
 
-	boost::coroutines::asymmetric_coroutine<float>::push_type demodulator(FSK_demodulator<240,80>);
+	boost::coroutines::asymmetric_coroutine<float>::push_type demodulator(FSK_demodulator<480,96>);
 
 	// 打开音频设备
 	pa_simple pa(NULL, "SiFi", PA_STREAM_RECORD, NULL, "receive SiFi signals", &ss, NULL, NULL);
@@ -470,7 +470,7 @@ static void SiFi_Tx()
 			s = samples.get() * 32000;
 
 			samples();
-			
+			demodulator(s);
 			// 如果 FSK 调制器挂了，就别输出啦！
 			if(!samples)
 				break;
@@ -481,15 +481,24 @@ static void SiFi_Tx()
 	// RAII 自动关闭了
 }
 
+void send_packet(std::array<uint8_t,11> packet)
+{
+	packet_send_buffer.push(packet);
+}
+
 int main(int argc, char **argv)
 {	
 	std::array<uint8_t,11> packet = { 'H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd' };
 	
-	packet_send_buffer.push(packet);
 	
-	std::thread Rxthread(SiFi_Rx);
+	//std::thread Rxthread(SiFi_Rx);
 	std::thread Txthread(SiFi_Tx);
+
+	sleep(1);
+	
+	send_packet(packet);
+	
 	Txthread.join();
-	Rxthread.join();	
+	//Rxthread.join();	
     return 0;
 }
