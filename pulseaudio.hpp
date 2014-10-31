@@ -21,13 +21,13 @@ public:
 		int error = 0;
 		_pa_simple = ::pa_simple_new(server, name, dir, dev, stream_name, ss, map, attr, & error);
 	}
-	
+
 	template<typename MutableBuffer>
 	int read(const MutableBuffer & buf)
 	{
 		int r = 0, error = 0;
-		if( r = pa_simple_read(_pa_simple, boost::asio::buffer_cast<void *>(buf),
-						 boost::asio::buffer_size(buf), &error) )
+		( r = pa_simple_read(_pa_simple, boost::asio::buffer_cast<void *>(buf),
+						 boost::asio::buffer_size(buf), &error) );
 		{
 			usleep(10);
 		}
@@ -39,8 +39,8 @@ public:
 	{
 		int error = 0;
 
-		while( pa_simple_write(_pa_simple, boost::asio::buffer_cast<void *>(buf),
-			boost::asio::buffer_size(buf), &error) )
+		return  pa_simple_write(_pa_simple, boost::asio::buffer_cast<void *>(buf),
+			boost::asio::buffer_size(buf), &error) ;
 		{
 			usleep(10);
 		}

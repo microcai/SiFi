@@ -1,11 +1,11 @@
-
+﻿
 #include <cmath>
 #include <iostream>
 #include <algorithm>
 #include <bitset>
 #include <array>
 #include <thread>
-#include <functional> 
+#include <functional>
 #include <boost/asio/buffer.hpp>
 #include <boost/math/constants/constants.hpp>
 #include <fftw3.h>
@@ -24,7 +24,7 @@ T circumference(T r)
 
 static std::array<int,3> target_frequency[] =
 {
-	{ 1200 , 2200 ,0},
+	{ 2000 , 4800 ,0},
 
 	{ 300 , 330 ,0},
 	{ 370 , 400 ,0},
@@ -53,7 +53,7 @@ static void packet_decoder(boost::coroutines::asymmetric_coroutine<uint8_t>::pul
 }
 
 
-static dqueue<5, std::array<uint8_t, 11>> packet_send_buffer;
+static dqueue<5, std::vector<uint8_t>> packet_send_buffer;
 
 // 数据打包编码
 static void datapacker(boost::coroutines::asymmetric_coroutine<uint8_t>::push_type & sink)
@@ -92,25 +92,27 @@ static 	int t=0;
 static void channel_decode(boost::coroutines::asymmetric_coroutine<bool>::pull_type & source)
 {
 	#include "4b5btable.ipp"
-	
+
 	std::bitset<5> codegroup = {0};
 
 	while(source)
 	{
 
 		bool bit = source.get();
+		std::fprintf(stderr, "\r[%08d] get %d !!!!!!!!!!!\n", t, bit);
+
 		codegroup <<= 1;
 		codegroup |= bit;
 		source();
 
 		// 00000 序列表示重启解码器
 		// 11111 序列表示一个帧开始
-		
+
 		if( codegroup == 0b00000)
 		{
 			continue;
 		}
-		
+
 		// 找到同步序列
 		if( codegroup == 0b11111)
 		{
@@ -124,7 +126,6 @@ static void channel_decode(boost::coroutines::asymmetric_coroutine<bool>::pull_t
 
 			while(source)
 			{
-				
 				// 一次拉 5 个
 				for(int i=0; i < 5 ; i++)
 				{
@@ -133,8 +134,11 @@ static void channel_decode(boost::coroutines::asymmetric_coroutine<bool>::pull_t
 					codegroup |= bit;
 					source();
 				}
-				// 传递流水线执行数据包解码	 
-				pipeline_feed(FFM_decode_table[codegroup.to_ulong()]);
+				// 传递流水线执行数据包解码
+				if( codegroup != 0b11111)
+					pipeline_feed(FFM_decode_table[codegroup.to_ulong()]);
+				else
+					break;
 			}
 		}
 	}
@@ -151,10 +155,13 @@ static void BaseBand_Decode(boost::coroutines::asymmetric_coroutine<bool>::pull_
 	while(source)
 	{
 		bool bit = source.get();
-		
+
+//		std::fprintf(stderr, "[%d]and get %s \n", t, bit?"1":"0");
+
+
 		int count = 0;
 		int abscount = 0;
-		
+
 		while(source && bit == prev_bit)
 		{
 			source();
@@ -170,7 +177,7 @@ static void BaseBand_Decode(boost::coroutines::asymmetric_coroutine<bool>::pull_
 			bit = source.get();
 		}
 		// 经历了超长时间的低频率，意思重启解码器
-		if( abscount >= 45)
+		if( abscount >= 45000)
 		{
 			if( bit )
 			{
@@ -192,7 +199,7 @@ static void BaseBand_Decode(boost::coroutines::asymmetric_coroutine<bool>::pull_
 				continue;
 			}
 		}
-		
+
 		if( count > 5)
 		{
 			Decoder(current_bit);
@@ -205,8 +212,13 @@ static void BaseBand_Decode(boost::coroutines::asymmetric_coroutine<bool>::pull_
 }
 
 // 基带信号滤波
-static void BaseBand_Filter(boost::coroutines::asymmetric_coroutine<std::tuple<double,double>>::pull_type & source)
+template<unsigned samples_per_chip>
+static void baseband_filter(boost::coroutines::asymmetric_coroutine<std::tuple<double,double>>::pull_type & source)
 {
+	double max_power = 0.0;
+
+	const double mix_signal_power = -30.0;
+
 	while(source)
 	{
 		auto signalpair = source.get();
@@ -215,18 +227,23 @@ static void BaseBand_Filter(boost::coroutines::asymmetric_coroutine<std::tuple<d
 		auto freq1 = std::get<0>(signalpair);
 		auto freq2 = std::get<1>(signalpair);
 
-		if( freq1 + freq2 < 4 )
+		if( max_power <  freq1 + freq2)
 		{
-			std::fprintf(stderr, "\r[%08d] no signal", t);
+			max_power = freq1 + freq2;
+		}
+
+		if( freq1 + freq2 < mix_signal_power )
+		{
+			std::fprintf(stderr, "\r[%08d] no signal (%f  %f, %f)", t, max_power, freq1 , freq2);
 			continue;
 		}
-		
-		std::array<uint8_t, 10> cap;
+
+		std::array<uint8_t, samples_per_chip> cap;
 		std::fill(std::begin(cap), std::end(cap),0);
 
 		// 预填充
-		for(int i = 10 - 5; i < 10 && source && (freq1 + freq2 > 4); i++)
-		{			
+		for(int i = samples_per_chip/2 ; i < samples_per_chip && source && (freq1 + freq2 >= mix_signal_power); i++)
+		{
 			// 预填充 4 个信号点
 			cap[i] = (freq1 < freq2);
 
@@ -235,9 +252,9 @@ static void BaseBand_Filter(boost::coroutines::asymmetric_coroutine<std::tuple<d
 			freq2 = std::get<1>(signalpair);
 		}
 
-		if( freq1 + freq2 < 4 )
+		if( freq1 + freq2 < mix_signal_power )
 		{
-			std::fprintf(stderr, "\r[%08d] no signal", t);
+			std::fprintf(stderr, "\r[%08d] no signal !!!!!!!!!!!\n", t);
 			continue;
 		}
 
@@ -250,13 +267,15 @@ static void BaseBand_Filter(boost::coroutines::asymmetric_coroutine<std::tuple<d
 			cap.back() = (freq1 < freq2);
 
 			// 整理出 10 个信号点并平均化
-			Decoder( std::accumulate(std::begin(cap), std::end(cap),0) >= 5 );
+			Decoder( std::accumulate(std::begin(cap), std::end(cap),0) > 5 );
+
+		//	std::fprintf(stderr, "\r[%08d] yes signal (%030f, %030f)", t, freq1 , freq2);
 
 			signalpair = source.get();
 			source();
 			freq1 = std::get<0>(signalpair);
 			freq2 = std::get<1>(signalpair);
-		}while(source && (freq1 + freq2 > 4));
+		}while(source && (freq1 + freq2 > mix_signal_power));
 
 		// 再赛进去 5 个来
 				// 预填充
@@ -265,8 +284,10 @@ static void BaseBand_Filter(boost::coroutines::asymmetric_coroutine<std::tuple<d
 			// 预填充 4 个信号点
 			std::move(std::begin(cap)+1, std::end(cap), std::begin(cap));
 			cap.back() = 0;
-			Decoder( std::accumulate(std::begin(cap), std::end(cap),0) >= 5 );
+			Decoder( std::accumulate(std::begin(cap), std::end(cap),0) > 5 );
 		}
+
+		std::fprintf(stderr, "\r[%08d] no signal !!!!!!!!!!! sooooooooooo bad\n", t);
 	}
 }
 
@@ -278,9 +299,9 @@ static void channel_encoder(boost::coroutines::asymmetric_coroutine<int>::push_t
 	while(sink)
 	{
 		boost::coroutines::asymmetric_coroutine<uint8_t>::pull_type packer(datapacker);
-		
+
 		// 把数据包进行编码
-		
+
 		// 首先检查是否有数据包
 		if(!packer)
 		{
@@ -301,38 +322,40 @@ static void channel_encoder(boost::coroutines::asymmetric_coroutine<int>::push_t
 				int bit = bits & 0b10000;
 				if(bit)
 					prev_bit = !prev_bit;
-				
+
 				sink(prev_bit);
 			}
-						
+
 		};
-			
+
 		// 有数据包了，那么循环进入
-		
-		// 首先生成一段同步序列  低低低低低高低高低高，表示 0000011111 ， 
+
+		// 首先生成一段同步序列  低低低低低高低高低高，表示 0000011111 ，
 		// 这个是不会出现在任何编码结果中的序列
 		put5b(0);
 		put5b(FFM_encode_table[16]);
-		
+
 		// 接着进入 4b/5b 编码
 		do{
 			uint8_t byte = packer.get();
-
 			put5b(FFM_encode_table[ byte >> 4 ]);
 			put5b(FFM_encode_table[ byte & 0xF ]);
-
 			packer();
 		}while(packer);
+		put5b(FFM_encode_table[0]);
+		put5b(FFM_encode_table[16]);
 	}
 }
 
 
 #include "Goertzel.hpp"
 
-template<unsigned windowssize, unsigned incremental>
+template<unsigned windowssize, unsigned chipsize, unsigned samples_per_chip>
 static void FSK_demodulator(boost::coroutines::asymmetric_coroutine<float>::pull_type & source)
 {
 	std::array<float, windowssize> Samples;
+
+	auto const incremental = chipsize / samples_per_chip;
 
 	const std::array<float, windowssize> Hammingwindow = [](){
 		std::array<float, windowssize> r;
@@ -345,7 +368,7 @@ static void FSK_demodulator(boost::coroutines::asymmetric_coroutine<float>::pull
 		return r;
 	}();
 
-	boost::coroutines::asymmetric_coroutine<std::tuple<double,double>>::push_type baseband_filter(BaseBand_Filter);
+	boost::coroutines::asymmetric_coroutine<std::tuple<double,double>>::push_type baseband_filter(baseband_filter<samples_per_chip>);
 
 	while(source)
 	{
@@ -372,7 +395,29 @@ static void FSK_demodulator(boost::coroutines::asymmetric_coroutine<float>::pull
 	}
 }
 
-//  FSK 调制器
+// 加一个窗口
+template<unsigned chipsize, unsigned guardgap>
+static void chipwindow(boost::coroutines::asymmetric_coroutine<double>::push_type & sink)
+{
+	for( int i = 0 ;  i < guardgap/2; i++)
+	{
+		sink ( 0.5001 - std::cos( circumference( (double)i / (double)guardgap) ) /2 );
+	}
+
+	for(int i = 0; i < chipsize - guardgap ; i ++)
+		sink(1.0);
+
+	for( int i = 0 ;  i < guardgap/2; i++)
+	{
+		sink ( 0.5001 + std::cos( circumference( (double)i / (double)guardgap) ) /2 );
+	}
+
+	while(true)
+		sink(0.0);
+}
+
+//  FSK 调制器, 有码间留空的版本
+template<unsigned chipsize, unsigned guardgap>
 static void FSK_modulator(boost::coroutines::asymmetric_coroutine<double>::push_type & sink)
 {
 	const double TWO_PI = 4 * std::asin(1.0);
@@ -380,9 +425,14 @@ static void FSK_modulator(boost::coroutines::asymmetric_coroutine<double>::push_
 
 	boost::coroutines::asymmetric_coroutine<int>::pull_type encoder(channel_encoder);
 
+	auto chipsamplesize = chipsize - guardgap;
+
 	// 循环读取
 	do
 	{
+
+		boost::coroutines::asymmetric_coroutine<double>::pull_type chipwindow(chipwindow<chipsize, guardgap>);
+
 		// 读入一个比特
 		int modulation_bit = encoder.get();
 
@@ -391,14 +441,15 @@ static void FSK_modulator(boost::coroutines::asymmetric_coroutine<double>::push_
 
 		// 生成正玄波， 用三角函数算呗！
 		// 根据频率和采样率，计算采样点坐标
-		for(int i=0; i < 960 ; i++)
+		for(int i=0; i < chipsize ; i++, chipwindow())
 		{
 			double s = std::sin( TWO_PI * (last_sample));
 			last_sample += desired_freq / samplerate;
-			// 吐出生成数据给流水线下一条
-			sink(s);
+			// 加窗后吐出生成数据给流水线下一条
+			sink(s * chipwindow.get());
 		}
-			// 圆整到 [0,1]
+
+		// 圆整到 [0,1]
 		last_sample -= (long)last_sample;
 		if(last_sample > 0.999999)
 				last_sample = 0;
@@ -406,16 +457,20 @@ static void FSK_modulator(boost::coroutines::asymmetric_coroutine<double>::push_
 	}while(encoder);
 }
 
+#define CHIPSIZE 960
+#define GAPSIZE 96
+#define SAMPLES_PER_CHIP 10
+
 // 接收器
 static void SiFi_Rx()
 {
 	static const pa_sample_spec ss = {
 		PA_SAMPLE_S16LE,
 		samplerate,
-		1
+		2
 	};
 
-	boost::coroutines::asymmetric_coroutine<float>::push_type demodulator(FSK_demodulator<480,96>);
+	boost::coroutines::asymmetric_coroutine<float>::push_type demodulator(FSK_demodulator<CHIPSIZE/2,CHIPSIZE, SAMPLES_PER_CHIP>);
 
 	// 打开音频设备
 	pa_simple pa(NULL, "SiFi", PA_STREAM_RECORD, NULL, "receive SiFi signals", &ss, NULL, NULL);
@@ -423,15 +478,19 @@ static void SiFi_Rx()
 	// 循环读取
 	while(true)
 	{
-		std::array<int16_t, 480> buf = { 0 };
+		std::array<int16_t, 1024> buf = { 0 };
 		auto  readed = pa.read(boost::asio::buffer(buf, buf.size()));
 
-		BOOST_VERIFY(readed == 0);
+		if(readed != 0)
+		{
+			exit(1);
+		}
 
 		// 传递给流水线下一步
-		for( auto sample : buf)
+		for(int i=0; i < buf.size(); i+=2)
 		{
-			demodulator( sample / 32768.0 );
+			// 丢掉一个频道
+			demodulator( buf[i] / 32768.0 );
 		}
 	}
 	// RAII 自动关闭了
@@ -447,14 +506,14 @@ static void SiFi_Tx()
 	};
 
 	int error;
-	// 打开音频设备	
+	// 打开音频设备
 	pa_simple pa(NULL, "SiFi", PA_STREAM_PLAYBACK, NULL, "transmit SiFi signals", &ss, NULL, NULL);
-	
-	pa_simple_flush(pa.get(), &error);
-	
-	boost::coroutines::asymmetric_coroutine<double>::pull_type samples(FSK_modulator);
 
-	boost::coroutines::asymmetric_coroutine<float>::push_type demodulator(FSK_demodulator<480,96>);
+	pa_simple_flush(pa.get(), &error);
+
+	boost::coroutines::asymmetric_coroutine<double>::pull_type samples(FSK_modulator<CHIPSIZE, GAPSIZE>);
+
+	boost::coroutines::asymmetric_coroutine<float>::push_type demodulator(FSK_demodulator<CHIPSIZE/2,CHIPSIZE, SAMPLES_PER_CHIP>);
 
 	double last_sample = 0.0;
 	// 循环写入
@@ -481,24 +540,24 @@ static void SiFi_Tx()
 	// RAII 自动关闭了
 }
 
-void send_packet(std::array<uint8_t,11> packet)
+void send_packet(std::vector<uint8_t> packet)
 {
 	packet_send_buffer.push(packet);
 }
 
 int main(int argc, char **argv)
-{	
-	std::array<uint8_t,11> packet = { 'H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd' };
-	
-	
-	//std::thread Rxthread(SiFi_Rx);
+{
+	std::vector<uint8_t> packet = { 'H', 'e', 'l', 'l', 'o', ' ', 'w', 'o', 'r', 'l', 'd' };
+
+
+	std::thread Rxthread(SiFi_Rx);
 	std::thread Txthread(SiFi_Tx);
 
-	sleep(1);
-	
+	//sleep(1);
+
 	send_packet(packet);
-	
+
 	Txthread.join();
-	//Rxthread.join();	
+	Rxthread.join();
     return 0;
 }
