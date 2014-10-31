@@ -39,23 +39,11 @@ void File_Rx()
         exit(0);
     }
 
-    AVFrame * avframe = av_frame_alloc();
-	BOOST_SCOPE_EXIT_ALL(&avframe)
-	{
-		av_frame_free(&avframe);
-	};
-
 	// 循环读取
     while(true)
     {
 		AVPacket packet = { 0 };
-
-		int got_frame = 0;
-		std::array<int16_t, 2048> buf = { 0 };
-//		auto  readed = pa.read(boost::asio::buffer(buf, buf.size()));
-
 		av_init_packet(&packet);
-
 		BOOST_SCOPE_EXIT_ALL(&packet)
 		{
 			av_free_packet(&packet);
@@ -66,8 +54,15 @@ void File_Rx()
 		if( packet.stream_index != audio_stream_index)
 			continue;
 
+		AVFrame * avframe = av_frame_alloc();
+		BOOST_SCOPE_EXIT_ALL(&avframe)
+		{
+			av_frame_free(&avframe);
+		};
+
 		while(1)
 		{
+			int got_frame = 0;
 			int ret = avcodec_decode_audio4(avcontext->streams[audio_stream_index]->codec, avframe, &got_frame, &packet);
 			if( ret < 0 )
 			{
