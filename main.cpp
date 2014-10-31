@@ -7,7 +7,6 @@
 #include <thread>
 #include <functional>
 #include <boost/asio/buffer.hpp>
-#include <fftw3.h>
 #include <boost/coroutine/asymmetric_coroutine.hpp>
 
 #include "common.hpp"
@@ -209,7 +208,7 @@ static void BaseBand_Decode(boost::coroutines::asymmetric_coroutine<bool>::pull_
 
 // 基带信号滤波
 template<unsigned samples_per_chip>
-static void baseband_filter(boost::coroutines::asymmetric_coroutine<std::tuple<double,double>>::pull_type & source)
+static void baseband_filter(boost::coroutines::asymmetric_coroutine<std::tuple<double,double,double>>::pull_type & source)
 {
 	double max_power = 0.0;
 
@@ -222,15 +221,16 @@ static void baseband_filter(boost::coroutines::asymmetric_coroutine<std::tuple<d
 
 		auto freq1 = std::get<0>(signalpair);
 		auto freq2 = std::get<1>(signalpair);
+		auto snr = std::get<2>(signalpair);
 
 		if( max_power <  freq1 + freq2)
 		{
 			max_power = freq1 + freq2;
 		}
 
-		if( freq1 + freq2 < mix_signal_power )
+		if( snr < mix_signal_power )
 		{
-			std::fprintf(stderr, "\r[%08d] no signal (%f  %f, %f)", t, max_power, freq1 , freq2);
+			std::fprintf(stderr, "\r[%08d] too low SNR %2.4f db", t, (float)snr);
 			continue;
 		}
 
@@ -238,7 +238,7 @@ static void baseband_filter(boost::coroutines::asymmetric_coroutine<std::tuple<d
 		std::fill(std::begin(cap), std::end(cap),0);
 
 		// 预填充
-		for(int i = samples_per_chip/2 ; i < samples_per_chip && source && (freq1 + freq2 >= mix_signal_power); i++)
+		for(int i = samples_per_chip/2 ; i < samples_per_chip && source && ( snr >= mix_signal_power); i++)
 		{
 			// 预填充 4 个信号点
 			cap[i] = (freq1 < freq2);
@@ -246,6 +246,7 @@ static void baseband_filter(boost::coroutines::asymmetric_coroutine<std::tuple<d
 			signalpair = source.get(); source();
 			freq1 = std::get<0>(signalpair);
 			freq2 = std::get<1>(signalpair);
+			snr = std::get<2>(signalpair);
 		}
 
 		if( freq1 + freq2 < mix_signal_power )
@@ -343,117 +344,7 @@ static void channel_encoder(boost::coroutines::asymmetric_coroutine<int>::push_t
 	}
 }
 
-
-#include "Goertzel.hpp"
-
-template<unsigned windowssize, unsigned chipsize, unsigned samples_per_chip>
-static void FSK_demodulator(boost::coroutines::asymmetric_coroutine<float>::pull_type & source)
-{
-	std::array<float, windowssize> Samples;
-
-	auto const incremental = chipsize / samples_per_chip;
-
-	const std::array<float, windowssize> Hammingwindow = [](){
-		std::array<float, windowssize> r;
-		for(int i=0; i < r.size(); i++)
-		{
-			r[i] = 0.5 * (
-				1 - std::cos( circumference<double>(i) / (r.size() -1) )
-			);
-		}
-		return r;
-	}();
-
-	boost::coroutines::asymmetric_coroutine<std::tuple<double,double>>::push_type baseband_filter(baseband_filter<samples_per_chip>);
-
-	while(source)
-	{
-		std::array<float, windowssize> CheckWindow = { 0 };
-
-		// 移动 incremental 个采样点
-		std::move(std::begin(Samples)+incremental, std::end(Samples), std::begin(Samples));
-		for(unsigned i = windowssize - incremental; i < windowssize ; i++)
-		{
-			Samples[i] = source.get();
-			source();
-		}
-		// 加 Hammingwindow
-		std::transform(std::begin(Samples), std::end(Samples),
-			std::begin(Hammingwindow), std::begin(CheckWindow), [](auto a, auto b){return a * b;});
-
-		// 执行检测
-		auto freq1 = Goertzel_frequency_detector<windowssize>(CheckWindow, freq_selector()[0], samplerate);
-		auto freq2 = Goertzel_frequency_detector<windowssize>(CheckWindow, freq_selector()[1], samplerate);
-
-		// NOTE: 向流水线下游传递，从频点信号中恢复基带信号
-		t++;
-		baseband_filter(std::make_tuple(freq1,freq2));
-	}
-}
-
-// 加一个窗口
-template<unsigned chipsize, unsigned guardgap>
-static void chipwindow(boost::coroutines::asymmetric_coroutine<double>::push_type & sink)
-{
-	for( int i = 0 ;  i < guardgap/2; i++)
-	{
-		sink ( 0.5001 - std::cos( circumference( (double)i / (double)guardgap) ) /2 );
-	}
-
-	for(int i = 0; i < chipsize - guardgap ; i ++)
-		sink(1.0);
-
-	for( int i = 0 ;  i < guardgap/2; i++)
-	{
-		sink ( 0.5001 + std::cos( circumference( (double)i / (double)guardgap) ) /2 );
-	}
-
-	while(true)
-		sink(0.0);
-}
-
-//  FSK 调制器, 有码间留空的版本
-template<unsigned chipsize, unsigned guardgap>
-static void FSK_modulator(boost::coroutines::asymmetric_coroutine<double>::push_type & sink)
-{
-	const double TWO_PI = 4 * std::asin(1.0);
-	double last_sample = 0.0;
-
-	boost::coroutines::asymmetric_coroutine<int>::pull_type encoder(channel_encoder);
-
-	auto chipsamplesize = chipsize - guardgap;
-
-	// 循环读取
-	do
-	{
-
-		boost::coroutines::asymmetric_coroutine<double>::pull_type chipwindow(chipwindow<chipsize, guardgap>);
-
-		// 读入一个比特
-		int modulation_bit = encoder.get();
-
-		// 生成一段时间的正玄波信号, 如果没有信号就会生成一段空白。
-		double desired_freq = freq_selector() [modulation_bit];
-
-		// 生成正玄波， 用三角函数算呗！
-		// 根据频率和采样率，计算采样点坐标
-		for(int i=0; i < chipsize ; i++, chipwindow())
-		{
-			double s = std::sin( TWO_PI * (last_sample));
-			last_sample += desired_freq / samplerate;
-			// 加窗后吐出生成数据给流水线下一条
-			sink(s * chipwindow.get());
-		}
-
-		// 圆整到 [0,1]
-		last_sample -= (long)last_sample;
-		if(last_sample > 0.999999)
-				last_sample = 0;
-		encoder();
-	}while(encoder);
-}
-
-#include "RF_chip.ipp"
+#include "RF_chip.hpp"
 
 void send_packet(std::vector<uint8_t> packet)
 {

@@ -22,5 +22,5 @@ static double Goertzel_frequency_detector(const std::array<float, windowssize> &
 	}
 
 	auto power = s_prev2*s_prev2 + s_prev*s_prev - coeff*s_prev*s_prev2;
-	return std::log10(power) - 2.5;
+	return power;
 }
