@@ -7,20 +7,14 @@
 #include <thread>
 #include <functional>
 #include <boost/asio/buffer.hpp>
-#include <boost/math/constants/constants.hpp>
 #include <fftw3.h>
 #include <boost/coroutine/asymmetric_coroutine.hpp>
 
+#include "common.hpp"
 #include "dqueue.hpp"
 #include "pulseaudio.hpp"
 
 static const int samplerate = 48000;
-
-template <class T>
-T circumference(T r)
-{
-   return boost::math::constants::two_pi<T>() * r;
-}
 
 static std::array<int,3> target_frequency[] =
 {
@@ -266,8 +260,8 @@ static void baseband_filter(boost::coroutines::asymmetric_coroutine<std::tuple<d
 			std::move(std::begin(cap)+1, std::end(cap), std::begin(cap));
 			cap.back() = (freq1 < freq2);
 
-			// 整理出 10 个信号点并平均化
-			Decoder( std::accumulate(std::begin(cap), std::end(cap),0) > 5 );
+			// 整理出 samples_per_chip 个信号点并平均化
+			Decoder( std::accumulate(std::begin(cap), std::end(cap),0) > (samples_per_chip/2) );
 
 		//	std::fprintf(stderr, "\r[%08d] yes signal (%030f, %030f)", t, freq1 , freq2);
 
@@ -277,14 +271,14 @@ static void baseband_filter(boost::coroutines::asymmetric_coroutine<std::tuple<d
 			freq2 = std::get<1>(signalpair);
 		}while(source && (freq1 + freq2 > mix_signal_power));
 
-		// 再赛进去 5 个来
-				// 预填充
-		for(int i = 0; i < 5 && source; i++)
+		// 再赛进去 samples_per_chip/2 个来
+		// 预填充
+		for(int i = 0; i < (samples_per_chip/2) && source; i++)
 		{
 			// 预填充 4 个信号点
 			std::move(std::begin(cap)+1, std::end(cap), std::begin(cap));
 			cap.back() = 0;
-			Decoder( std::accumulate(std::begin(cap), std::end(cap),0) > 5 );
+			Decoder( std::accumulate(std::begin(cap), std::end(cap),0) > (samples_per_chip/2) );
 		}
 
 		std::fprintf(stderr, "\r[%08d] no signal !!!!!!!!!!! sooooooooooo bad\n", t);
