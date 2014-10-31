@@ -49,7 +49,12 @@ void File_Rx()
 			av_free_packet(&packet);
 		};
 
-		av_read_frame(avcontext, &packet);
+		// finished
+		if( av_read_frame(avcontext, &packet) < 0 )
+		{
+			std::cerr << "file EOF" << std::endl;
+			break;
+		}
 
 		if( packet.stream_index != audio_stream_index)
 			continue;
